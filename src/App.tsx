@@ -100,7 +100,9 @@ export default function App() {
         {route === 'architecture' && (
           <ArchitectureView onInspectSwiftFile={handleInspectSwiftFile} />
         )}
-        {route === 'spec' && <ProtocolSpecView />}
+        {route === 'spec' && (
+          <ProtocolSpecView onInspectFile={handleInspectSwiftFile} />
+        )}
       </main>
     </div>
   );

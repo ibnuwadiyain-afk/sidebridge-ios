@@ -10,11 +10,14 @@ export interface ProjectFile {
   bytes: number;
 }
 
-const rawModules = import.meta.glob('/ios/SideBridge/**/*', {
-  query: '?raw',
-  import: 'default',
-  eager: true,
-}) as Record<string, string>;
+const rawModules = import.meta.glob(
+  ['/ios/SideBridge/**/*', '/ios/SideBridge/.github/**/*'],
+  {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }
+) as Record<string, string>;
 
 function detectLanguage(path: string): ProjectFile['language'] {
   if (path.endsWith('.swift')) return 'swift';
@@ -26,6 +29,7 @@ function detectLanguage(path: string): ProjectFile['language'] {
 
 function detectGroup(relativePath: string): string {
   if (relativePath === 'project.yml' || relativePath === 'README.md') return 'Project Root';
+  if (relativePath.startsWith('.github/')) return 'CI / CD (GitHub Actions)';
   if (relativePath.startsWith('SideBridgeTunnel/')) return 'Network Extension';
   if (relativePath.startsWith('SideBridge/Resources/') || relativePath.startsWith('SideBridge/Bridging/')) {
     return 'Entitlements & Bridging';
@@ -43,6 +47,7 @@ function detectGroup(relativePath: string): string {
 
 const GROUP_ORDER = [
   'Project Root',
+  'CI / CD (GitHub Actions)',
   'Entitlements & Bridging',
   'Network Extension',
   'Core / Storage',

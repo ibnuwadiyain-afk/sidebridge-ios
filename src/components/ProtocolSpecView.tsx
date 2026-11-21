@@ -1,7 +1,11 @@
 import React, { useState } from 'react';
-import { Check, Copy, Terminal } from 'lucide-react';
+import { Check, ChevronRight, Copy, FileCode2, Terminal } from 'lucide-react';
 
-export const ProtocolSpecView: React.FC = () => {
+interface ProtocolSpecViewProps {
+  onInspectFile: (relativePath: string) => void;
+}
+
+export const ProtocolSpecView: React.FC<ProtocolSpecViewProps> = ({ onInspectFile }) => {
   const [selectedFrame, setSelectedFrame] = useState<'lockdown' | 'afc' | 'superblob'>('afc');
   const [copiedCmd, setCopiedCmd] = useState(false);
 
@@ -21,10 +25,10 @@ open SideBridge.xcodeproj`;
     <div className="mx-auto max-w-[1440px] px-6 py-6 space-y-10">
       <div className="border-b border-slate-800/80 pb-5">
         <h1 className="text-xl font-semibold tracking-tight text-slate-100">
-          Wire Protocol Layout &amp; Xcode Build Guide
+          Wire Protocol Layout, Xcode Build &amp; GitHub Actions Release
         </h1>
         <p className="mt-1.5 max-w-3xl text-sm text-slate-400">
-          Binary framing reference matching Android SideBridge byte-for-byte, plus steps to generate and sign the Xcode project on macOS.
+          Binary framing reference matching Android SideBridge byte-for-byte, plus local XcodeGen steps and automated GitHub Actions IPA release configuration.
         </p>
       </div>
 
@@ -155,13 +159,73 @@ open SideBridge.xcodeproj`;
         </div>
       </section>
 
+      {/* Automated GitHub Actions IPA Build & Release */}
+      <section className="rounded-xl border border-slate-800 bg-[#11151E] p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-white">GitHub Actions IPA Build &amp; Auto-Release</h2>
+            <p className="mt-1 text-xs text-slate-400">
+              Bundled at <span className="font-mono text-slate-200">.github/workflows/build-ipa-release.yml</span>. Runs on <span className="font-mono text-slate-200">macos-15</span>, embeds <span className="font-mono text-slate-200">SideBridgeTunnel.appex</span>, generates <span className="font-mono text-slate-200">SHA256SUMS.txt</span>, and publishes directly to GitHub Releases on <span className="font-mono text-slate-200">v*.*.*</span> tags or manual dispatch.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onInspectFile('.github/workflows/build-ipa-release.yml')}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-blue-500 transition-colors whitespace-nowrap shrink-0"
+          >
+            <FileCode2 className="h-3.5 w-3.5" />
+            <span>Open Workflow YAML</span>
+            <ChevronRight className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-400">
+                <th className="py-2 pr-4 font-semibold">Repository Secret</th>
+                <th className="py-2 pr-4 font-semibold">Required For</th>
+                <th className="py-2 font-semibold">Purpose</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70 text-slate-300">
+              <tr>
+                <td className="py-2.5 pr-4 font-mono text-slate-100">None (Default Auto Mode)</td>
+                <td className="py-2.5 pr-4 whitespace-nowrap">Unsigned Sideload IPA</td>
+                <td className="py-2.5">Compiles arm64 release binaries and packages SideBridge-&lt;tag&gt;-unsigned.ipa with SideBridgeTunnel.appex for SideStore, AltStore, Sideloadly, or TrollStore.</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-mono text-slate-100">IOS_DIST_CERT_P12_BASE64</td>
+                <td className="py-2.5 pr-4 whitespace-nowrap">Signed IPA</td>
+                <td className="py-2.5">Base64-encoded distribution or development .p12 signing identity imported into an ephemeral runner keychain.</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-mono text-slate-100">IOS_DIST_CERT_PASSWORD</td>
+                <td className="py-2.5 pr-4 whitespace-nowrap">Signed IPA</td>
+                <td className="py-2.5">Passphrase unlocking the .p12 certificate during security import.</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-mono text-slate-100">IOS_APP_PROVISION_BASE64</td>
+                <td className="py-2.5 pr-4 whitespace-nowrap">Signed IPA</td>
+                <td className="py-2.5">Base64-encoded .mobileprovision profile for com.sidebridge.ios (App Group + Packet Tunnel).</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 pr-4 font-mono text-slate-100">IOS_TUNNEL_PROVISION_BASE64</td>
+                <td className="py-2.5 pr-4 whitespace-nowrap">Signed IPA</td>
+                <td className="py-2.5">Base64-encoded .mobileprovision profile for com.sidebridge.ios.tunnel Network Extension.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       {/* XcodeGen Build Steps */}
       <section className="grid grid-cols-1 gap-6 lg:grid-cols-12">
         <div className="lg:col-span-6 rounded-xl border border-slate-800 bg-[#11151E] p-5 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-sm font-semibold text-white">
               <Terminal className="h-4 w-4 text-blue-400" />
-              <span>Generate &amp; Build in Xcode 15+</span>
+              <span>Generate &amp; Build Locally in Xcode 15+</span>
             </div>
             <button
               type="button"

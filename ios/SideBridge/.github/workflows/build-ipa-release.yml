@@ -1,0 +1,384 @@
+name: Build iOS IPA & Publish GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v1.0.0). Leave empty to auto-generate v1.0.<run_number>."
+        required: false
+        default: ""
+      signing_mode:
+        description: "Signing mode: auto (signed if secrets exist, else unsigned), unsigned, or signed"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - unsigned
+          - signed
+      prerelease:
+        description: "Mark GitHub Release as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release-ipa:
+    name: Build SideBridge IPA (iOS 16+ arm64)
+    runs-on: macos-15
+
+    env:
+      SCHEME: SideBridge
+      APP_NAME: SideBridge
+      CONFIGURATION: Release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate SideBridge XcodeGen project directory
+        id: locate
+        run: |
+          if [ -f "project.yml" ]; then
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f "ios/SideBridge/project.yml" ]; then
+            echo "project_dir=ios/SideBridge" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not find project.yml in repository root or ios/SideBridge/"
+            exit 1
+          fi
+
+      - name: Resolve version & release tag
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="v1.0.${GITHUB_RUN_NUMBER}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode & install XcodeGen
+        run: |
+          xcodebuild -version
+          swift --version
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Determine signing mode
+        id: signing
+        env:
+          HAS_CERT: ${{ secrets.IOS_DIST_CERT_P12_BASE64 != '' }}
+          HAS_APP_PROFILE: ${{ secrets.IOS_APP_PROVISION_BASE64 != '' }}
+          HAS_TUNNEL_PROFILE: ${{ secrets.IOS_TUNNEL_PROVISION_BASE64 != '' }}
+        run: |
+          REQUESTED="${{ inputs.signing_mode || 'auto' }}"
+          if [ "$REQUESTED" = "unsigned" ]; then
+            MODE="unsigned"
+          elif [ "$REQUESTED" = "signed" ]; then
+            if [ "$HAS_CERT" != "true" ] || [ "$HAS_APP_PROFILE" != "true" ] || [ "$HAS_TUNNEL_PROFILE" != "true" ]; then
+              echo "::error::Signed mode requires IOS_DIST_CERT_P12_BASE64, IOS_DIST_CERT_PASSWORD, IOS_APP_PROVISION_BASE64, and IOS_TUNNEL_PROVISION_BASE64 secrets."
+              exit 1
+            fi
+            MODE="signed"
+          else
+            if [ "$HAS_CERT" = "true" ] && [ "$HAS_APP_PROFILE" = "true" ] && [ "$HAS_TUNNEL_PROFILE" = "true" ]; then
+              MODE="signed"
+            else
+              MODE="unsigned"
+            fi
+          fi
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved IPA signing mode: ${MODE}"
+
+      - name: Import signing certificate & provisioning profiles (Signed Mode)
+        if: steps.signing.outputs.mode == 'signed'
+        id: keychain
+        env:
+          CERT_B64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          CERT_PASS: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          APP_PROFILE_B64: ${{ secrets.IOS_APP_PROVISION_BASE64 }}
+          TUNNEL_PROFILE_B64: ${{ secrets.IOS_TUNNEL_PROVISION_BASE64 }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/sidebridge-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          echo "keychain_path=${KEYCHAIN_PATH}" >> "$GITHUB_OUTPUT"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" \
+            -P "$CERT_PASS" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # Extract exact signing identity name from the imported keychain
+          CODE_SIGN_ID=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/1\)/ {print $2; exit}')
+          if [ -z "$CODE_SIGN_ID" ]; then
+            echo "::error::No valid code-signing identity found inside IOS_DIST_CERT_P12_BASE64."
+            exit 1
+          fi
+          echo "code_sign_identity=${CODE_SIGN_ID}" >> "$GITHUB_OUTPUT"
+
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+
+          decode_profile() {
+            local B64="$1"
+            local OUT_NAME="$2"
+            local TMP_FILE="$RUNNER_TEMP/${OUT_NAME}.mobileprovision"
+            echo "$B64" | base64 --decode > "$TMP_FILE"
+            local PLIST_XML="$RUNNER_TEMP/${OUT_NAME}.plist"
+            security cms -D -i "$TMP_FILE" > "$PLIST_XML"
+            local UUID
+            UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" "$PLIST_XML")
+            local NAME
+            NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" "$PLIST_XML")
+            local TEAM
+            TEAM=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$PLIST_XML")
+            cp "$TMP_FILE" "$PROFILES_DIR/${UUID}.mobileprovision"
+            echo "${UUID}|${NAME}|${TEAM}"
+          }
+
+          APP_INFO=$(decode_profile "$APP_PROFILE_B64" "app")
+          TUNNEL_INFO=$(decode_profile "$TUNNEL_PROFILE_B64" "tunnel")
+
+          echo "app_profile_uuid=$(echo "$APP_INFO" | cut -d'|' -f1)" >> "$GITHUB_OUTPUT"
+          echo "app_profile_name=$(echo "$APP_INFO" | cut -d'|' -f2)" >> "$GITHUB_OUTPUT"
+          echo "tunnel_profile_uuid=$(echo "$TUNNEL_INFO" | cut -d'|' -f1)" >> "$GITHUB_OUTPUT"
+          echo "tunnel_profile_name=$(echo "$TUNNEL_INFO" | cut -d'|' -f2)" >> "$GITHUB_OUTPUT"
+          echo "team_id=$(echo "$APP_INFO" | cut -d'|' -f3)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure per-target signing in XcodeGen spec (Signed Mode)
+        if: steps.signing.outputs.mode == 'signed'
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        env:
+          TEAM_ID: ${{ steps.keychain.outputs.team_id }}
+          SIGN_IDENTITY: ${{ steps.keychain.outputs.code_sign_identity }}
+          APP_PROFILE: ${{ steps.keychain.outputs.app_profile_uuid }}
+          TUNNEL_PROFILE: ${{ steps.keychain.outputs.tunnel_profile_uuid }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          spec_path = pathlib.Path("project.yml")
+          text = spec_path.read_text(encoding="utf-8")
+
+          team_id = os.environ["TEAM_ID"]
+          sign_id = os.environ["SIGN_IDENTITY"]
+          app_prof = os.environ["APP_PROFILE"]
+          tunnel_prof = os.environ["TUNNEL_PROFILE"]
+
+          text = text.replace('DEVELOPMENT_TEAM: ""', f'DEVELOPMENT_TEAM: "{team_id}"\n    CODE_SIGN_STYLE: Manual\n    CODE_SIGN_IDENTITY: "{sign_id}"')
+          text = text.replace(
+            'PRODUCT_BUNDLE_IDENTIFIER: com.sidebridge.ios\n',
+            f'PRODUCT_BUNDLE_IDENTIFIER: com.sidebridge.ios\n        PROVISIONING_PROFILE_SPECIFIER: "{app_prof}"\n',
+            1,
+          )
+          text = text.replace(
+            'PRODUCT_BUNDLE_IDENTIFIER: com.sidebridge.ios.tunnel\n',
+            f'PRODUCT_BUNDLE_IDENTIFIER: com.sidebridge.ios.tunnel\n        PROVISIONING_PROFILE_SPECIFIER: "{tunnel_prof}"\n',
+            1,
+          )
+          spec_path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Generate Xcode project via XcodeGen
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          xcodegen generate --spec project.yml
+          ls -la
+
+      - name: Stamp version & build number into Info.plists
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          for PLIST in "SideBridge/Resources/Info.plist" "SideBridgeTunnel/Info.plist"; do
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.meta.outputs.version }}" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.meta.outputs.build_number }}" "$PLIST"
+          done
+
+      - name: Resolve Swift Package dependencies (ZIPFoundation & OpenSSL)
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project "${APP_NAME}.xcodeproj" \
+            -scheme "${SCHEME}"
+
+      - name: Archive & Export Signed IPA
+        if: steps.signing.outputs.mode == 'signed'
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          ARCHIVE_PATH="$RUNNER_TEMP/${APP_NAME}.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/export"
+
+          xcodebuild archive \
+            -project "${APP_NAME}.xcodeproj" \
+            -scheme "${SCHEME}" \
+            -configuration "${CONFIGURATION}" \
+            -destination "generic/platform=iOS" \
+            -archivePath "$ARCHIVE_PATH" \
+            | tee "$RUNNER_TEMP/xcodebuild-archive.log"
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${{ secrets.IOS_EXPORT_METHOD || 'ad-hoc' }}</string>
+            <key>teamID</key>
+            <string>${{ steps.keychain.outputs.team_id }}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>${{ steps.keychain.outputs.code_sign_identity }}</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>compileBitcode</key>
+            <false/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.sidebridge.ios</key>
+              <string>${{ steps.keychain.outputs.app_profile_name }}</string>
+              <key>com.sidebridge.ios.tunnel</key>
+              <string>${{ steps.keychain.outputs.tunnel_profile_name }}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+          IPA_OUT="$RUNNER_TEMP/dist/${APP_NAME}-${{ steps.meta.outputs.tag }}-signed.ipa"
+          cp "$EXPORT_DIR/${APP_NAME}.ipa" "$IPA_OUT"
+          echo "Built signed IPA: $IPA_OUT"
+
+      - name: Build & Package Sideload-Ready Unsigned IPA
+        if: steps.signing.outputs.mode == 'unsigned'
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist" "$RUNNER_TEMP/payload-stage/Payload"
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+
+          xcodebuild build \
+            -project "${APP_NAME}.xcodeproj" \
+            -scheme "${SCHEME}" \
+            -configuration "${CONFIGURATION}" \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            | tee "$RUNNER_TEMP/xcodebuild-unsigned.log"
+
+          PRODUCTS_DIR="$DERIVED_DATA/Build/Products/${CONFIGURATION}-iphoneos"
+          APP_BUNDLE="$PRODUCTS_DIR/${APP_NAME}.app"
+          TUNNEL_APPEX="$PRODUCTS_DIR/SideBridgeTunnel.appex"
+
+          if [ ! -d "$APP_BUNDLE" ]; then
+            echo "::error::Expected app bundle not found at $APP_BUNDLE"
+            exit 1
+          fi
+
+          # Ensure SideBridgeTunnel Network Extension is embedded in PlugIns/
+          if [ -d "$TUNNEL_APPEX" ] && [ ! -d "$APP_BUNDLE/PlugIns/SideBridgeTunnel.appex" ]; then
+            mkdir -p "$APP_BUNDLE/PlugIns"
+            cp -R "$TUNNEL_APPEX" "$APP_BUNDLE/PlugIns/"
+          fi
+
+          # Enforce Unix 0755 executable permissions on main binary & extension binary
+          chmod 0755 "$APP_BUNDLE/${APP_NAME}"
+          if [ -f "$APP_BUNDLE/PlugIns/SideBridgeTunnel.appex/SideBridgeTunnel" ]; then
+            chmod 0755 "$APP_BUNDLE/PlugIns/SideBridgeTunnel.appex/SideBridgeTunnel"
+          fi
+
+          cp -R "$APP_BUNDLE" "$RUNNER_TEMP/payload-stage/Payload/"
+          find "$RUNNER_TEMP/payload-stage" -name ".DS_Store" -delete
+
+          IPA_OUT="$RUNNER_TEMP/dist/${APP_NAME}-${{ steps.meta.outputs.tag }}-unsigned.ipa"
+          (cd "$RUNNER_TEMP/payload-stage" && zip -r -y -9 "$IPA_OUT" Payload)
+          echo "Built sideload-ready unsigned IPA: $IPA_OUT"
+
+      - name: Verify IPA structure & generate SHA-256 checksums
+        id: verify
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          IPA_FILE=$(ls -1 *.ipa | head -n 1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "::error::No .ipa file produced in $RUNNER_TEMP/dist"
+            exit 1
+          fi
+
+          echo "Verifying archive entries for $IPA_FILE..."
+          unzip -l "$IPA_FILE" | grep -E "Payload/${APP_NAME}\.app/${APP_NAME}$"
+          unzip -l "$IPA_FILE" | grep -E "Payload/${APP_NAME}\.app/PlugIns/SideBridgeTunnel\.appex/"
+
+          shasum -a 256 "$IPA_FILE" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "ipa_file=${IPA_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up ephemeral keychain & signing material
+        if: always() && steps.signing.outputs.mode == 'signed'
+        run: |
+          security delete-keychain "${{ steps.keychain.outputs.keychain_path }}" || true
+          rm -f "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/app.mobileprovision" "$RUNNER_TEMP/tunnel.mobileprovision" "$RUNNER_TEMP/app.plist" "$RUNNER_TEMP/tunnel.plist"
+
+      - name: Upload IPA workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.meta.outputs.tag }}-${{ steps.signing.outputs.mode }}-ipa
+          path: |
+            ${{ runner.temp }}/dist/*.ipa
+            ${{ runner.temp }}/dist/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: SideBridge ${{ steps.meta.outputs.tag }} (${{ steps.signing.outputs.mode }})
+          draft: false
+          prerelease: ${{ inputs.prerelease || false }}
+          generate_release_notes: true
+          files: |
+            ${{ runner.temp }}/dist/*.ipa
+            ${{ runner.temp }}/dist/SHA256SUMS.txt
+          body: |
+            ### SideBridge for iOS & iPadOS (`${{ steps.meta.outputs.tag }}`)
+
+            - **Build Mode**: `${{ steps.signing.outputs.mode }}` (`arm64`, iOS 16.0+)
+            - **Embedded Targets**: `SideBridge.app` + `PlugIns/SideBridgeTunnel.appex` (`NEPacketTunnelProvider`)
+            - **Artifact**: `${{ steps.verify.outputs.ipa_file }}`
+
+            #### Installation Notes
+            - **Unsigned IPA**: Sideload with AltStore, SideStore, Sideloadly, TrollStore, or another SideBridge device (auto-re-signs both the main app and `SideBridgeTunnel` extension).
+            - **Signed IPA**: Ready for direct installation via `SideBridge`, Xcode Devices, or `itms-services://` OTA.
