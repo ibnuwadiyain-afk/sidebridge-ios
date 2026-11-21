@@ -1,0 +1,54 @@
+Build a native iOS & iPadOS application in Swift 5.9+ (SwiftUI, iOS 16.0+, arm64) named **SideBridge**, porting the architecture, protocols, and signing engine of our Android SideBridge app so that once installed on an iOS device, it can sign and sideload `.ipa` packages to:
+1. **The same iOS device** (on-device sideloading via a local `NEPacketTunnelProvider` loopback VPN tunnel),
+2. **Another iOS/iPadOS device over Wi-Fi** (via Bonjour `_apple-mobdev2._tcp` -> TCP port `62078`), and
+3. **Another iOS/iPadOS device over a USB-C / OTG cable** (via Apple USB Ethernet / NCM / tethered interface TCP `62078`, with an abstract `DeviceTransport` layer so raw USB `usbmux` can also be plugged in on unsandboxed/jailbroken builds).
+
+### 1. Project & Entitlement Architecture
+- **Main App Target (`SideBridge`)**: SwiftUI + MVVM (`@Observable` / `ObservableObject`), App Group (`group.com.sidebridge.shared`), Keychain Sharing, `NSLocalNetworkUsageDescription`, `NSBonjourServices = ["_apple-mobdev2._tcp"]`, and `UISupportsDocumentBrowser` / `UTType` support for importing `.ipa`, `.p12`, `.mobileprovision`, and `.mobiledevicepairing` / `.plist` files via `UIDocumentPickerViewController` / `.fileImporter`.
+- **Network Extension Target (`SideBridgeTunnel` — `NEPacketTunnelProvider`)**: Local-only loopback VPN tunnel (no external VPN server) that routes a virtual subnet (e.g., `10.7.0.1`) back to the host device's `lockdownd` (`62078`) so the sandboxed app can install IPAs onto the same device via `com.apple.afc` and `com.apple.mobile.installation_proxy`.
+
+### 2. Core Modules to Implement (1:1 Port of Android SideBridge)
+1. **Secure Storage (`KeychainStorage` + `PairingStorage`)**:
+   - Store Apple ID session tokens, Anisette v3 identity, `.p12` signing identities, and `PairingRecord` structs (`udid`, `deviceName`, `hostId`, `systemBuid`, `hostCertificatePem`, `hostPrivateKeyPem`, `rootCertificatePem`, `deviceCertificatePem`, `wifiAddress`) in the shared Keychain / App Group.
+   - Support importing `.mobiledevicepairing` / `.plist` files (from JitterbugPair, `idevicepair`, or Android SideBridge export) and associating them with either "This Device" or remote devices.
+
+2. **Transport Layer (`DeviceTransport` protocol)**:
+   - `send(_ data: Data)`, `receive(maxLength:timeout:)`, `receiveExact(_ length:timeout:)`, `close()`.
+   - **`TcpDeviceTransport`**: Built on `Network.framework` (`NWConnection`) or non-blocking POSIX sockets with `TCP_NODELAY` and `SO_KEEPALIVE`.
+   - **`TlsDeviceTransport`**: In-memory **OpenSSL/BoringSSL BIO** wrapper (`SSL_new` + `BIO_s_mem()`) pinned to **TLS 1.2** using the `PairingRecord`'s `HostCertificate`, `HostPrivateKey`, and `RootCertificate` (avoids `SecTrust` rejections on self-signed `lockdownd` certs).
+   - **`WifiDeviceDiscovery`**: `NWBrowser` discovering `_apple-mobdev2._tcp`. **CRITICAL**: Always map Apple's byte-swapped mDNS placeholder port `32498` (`0x7EF2`) to real `lockdownd` TCP port `62078` (`0xF27E`).
+   - **`UsbNetworkDiscovery` (OTG Cable Mode)**: Monitor active `NWPathMonitor` / `getifaddrs()` USB-Ethernet/NCM/tethered interfaces (`en*`, `bridge*`, link-local `169.254.x.x`, hotspot `172.20.10.x`) and probe `:62078` for connected peer iOS devices.
+   - **`LocalTunnelManager`**: Manages `NETunnelProviderManager` lifecycle for same-device loopback sideloading.
+
+3. **Apple Device Protocol Stack (identical wire format to Android)**:
+   - **`PlistCodec`**: Wrapper around `PropertyListSerialization` supporting XML and `bplist00` binary plists.
+   - **`LockdownClient`**: 4-byte Big-Endian length-prefixed plist framing: `QueryType`, `GetValue` (`UniqueDeviceID`, `DeviceName`, `ProductVersion`, `SystemBUID`, `DevicePublicKey`), `StartSession` (upgrades underlying transport to `TlsDeviceTransport`), `StartService("com.apple.afc")`, and `StartService("com.apple.mobile.installation_proxy")`.
+   - **`AfcClient`**: Apple File Conduit binary packet framing (`CFA6LPAA` magic) streaming the signed IPA in 32KB–64KB chunks to `PublicStaging/<bundleId>.ipa` with live progress callbacks.
+   - **`InstallationProxyClient`**: Sends `Command = "Install"`, `PackagePath = "PublicStaging/<bundleId>.ipa"`, `ClientOptions = { CFBundleIdentifier, optional ApplicationSINF, optional iTunesMetadata }`, streaming `Status` and `PercentComplete` until `Complete` (with friendly actionable errors for iOS 16+ Developer Mode, Untrusted Developer Profile, and Locked Device).
+
+4. **Free Apple ID Personal Team Provisioner (`AppleDeveloperProvisioner`)**:
+   - Anisette v3 WebSocket/HTTP identity provisioning & one-time header minting with fallback servers.
+   - Apple GrandSlam (`gsa.apple.com/grandslam/GsService2/lookup`) **SRP-6a** (`s2k` / `s2k_fo`) authentication, 2FA trusted-device/SMS code submission, and **AES-256-GCM** decryption of the `com.apple.gs.xcode.auth` service token.
+   - Apple Developer Portal (`developerservices2.apple.com/services/QH65B2/...`) endpoints: `listTeams`, `listDevices`, `addDevice`, `listAllDevelopmentCerts`, `submitDevelopmentCSR`, `revokeDevelopmentCert`, `listAppIds`, `addAppId`, `downloadTeamProvisioningProfile`.
+   - **CRITICAL**: Always verify active certificates via `listAllDevelopmentCerts` before signing (auto-revoking/re-creating via CSR if revoked by Sideloadly/AltStore) and verify that the downloaded `.mobileprovision`'s `DeveloperCertificates` contains the active `.p12` leaf certificate SHA-1/SHA-256 thumbprint.
+
+5. **On-Device Mach-O & IPA Signing Engine (`IpaSigner` + `MachOSigner`)**:
+   - Unpack IPA (`ZIPFoundation` / `libzip`), embed `embedded.mobileprovision`, surgically update `CFBundleIdentifier` in the main app `Info.plist`, and detect FairPlay-encrypted `.sinf` binaries.
+   - **CRITICAL XNU CoreTrust Compliance**:
+     - Encode CMS (`0xfade0b01`) signature blobs in **strict definite-length DER** (no indefinite-length BER `0x80` tags).
+     - Omit RFC 6211 `cmsAlgorithmProtect` (`1.2.840.113549.1.9.52`) so `SignerInfo.signedAttrs` contains only Apple's exact 5 attributes (`contentType`, `signingTime`, `messageDigest`, `1.2.840.113635.100.9.1`, `1.2.840.113635.100.9.2`).
+     - Bundle **Apple WWDR G1 through G6** intermediate CA PEM certificates for complete chain construction.
+     - Recursively sign all nested `.framework` bundles and standalone Mach-O `.dylib`/executables bottom-up before generating `_CodeSignature/CodeResources` (SHA-1 & SHA-256).
+     - Leave nested `.framework/Info.plist` (`bplist00`) files byte-for-byte untouched unless `CFBundleResourceSpecification` is present.
+     - Hash embedded `__TEXT,__info_plist` sections in standalone Mach-O binaries for CodeDirectory Special Slot `-1`.
+     - Repack the signed IPA with `STORED` directory entries (`size = 0, crc = 0`) and Unix `0755` (`0x81ED`) external attributes on executables.
+
+6. **DeviceInstaller Orchestrator & SwiftUI Interface**:
+   - 4-stage installation pipeline (`Provisioning` -> `Signing` -> `AFC Uploading` -> `Installing`) with `beginBackgroundTask` protection, automatic fallback between USB-network and Wi-Fi when both are available, and an optional `itms-services://` OTA fallback for paid Ad-Hoc/Enterprise certificates.
+   - Clean dark precision SwiftUI TabView mirroring SideBridge's 6 views:
+     1. **Devices**: Shows "This Device (Loopback VPN)", discovered Wi-Fi devices, and USB-Ethernet/OTG peer devices, with "Test Connection" and pairing file import.
+     2. **Library**: Import local `.ipa` files, manage custom `.p12` / `.mobileprovision`, pick target device ("This Device" or remote), and trigger install.
+     3. **Apps**: Browse/download decrypted IPA repositories (e.g., Archive.org collection feed) and direct URL IPA downloads.
+     4. **Queue**: Live 4-stage stepper progress bar and redacted diagnostic protocol log console (`LOCKDOWN_TX/RX`, `AFC`, `INSTPROXY`, `SIGN`, `PROVISION`) with copy/export.
+     5. **Account**: Apple ID + 2FA login, Personal Team certificate status, and App ID quota tracker.
+     6. **Setup Wizard**: Guided onboarding for importing the `.mobiledevicepairing` file, enabling the Local Loopback VPN tunnel, enabling iOS 16+ Developer Mode, and trusting the Developer Profile.

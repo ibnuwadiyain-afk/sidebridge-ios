@@ -1,0 +1,6 @@
+{
+  "name": "SideBridge iOS",
+  "description": "Native iOS & iPadOS Swift 5.9+ IPA signing and sideloading studio with loopback VPN, Wi-Fi Bonjour, USB-C OTG transport, XNU CoreTrust signing engine, and interactive simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
